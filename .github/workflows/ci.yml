@@ -48,3 +48,11 @@ jobs:
       - name: Release build
         if: github.event_name == 'push'
         run: cargo build --release --workspace --locked
+        
+      - name: Upload arb-web binary
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: arb-web-linux-x64
+          path: target/release/arb-web
+          retention-days: 30
