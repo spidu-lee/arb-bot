@@ -24,7 +24,9 @@ function harness(storage = new Map()) {
       state, RULE_FIELDS, positionRuleForm, positionRulesEditor, ruleFields,
       rememberPositionRuleValues, rulePreferenceKey, ruleDraftKey, wirePositionRules,
       savePositionRules, saveStrategyParams, tradeBody, marginModeError, ruleFormError,
-      pnlSummary, bookExitText, rhRow, rhStatus, renderRhSpread,
+      pnlSummary, bookExitText, rhRow, rhStatus, renderRhSpread, rhOrderTarget, rhOriginNote, openRhInStrategy, rhAutoForm, rhAutoBody, rhAutoHtml, saveRhAuto,
+      mockPrompt(fn) { globalThis.window = { prompt: fn }; },
+      mockShowPage(fn) { showPage = fn; },
       mockApi(fn) { api = fn; },
       mockRefresh(fn) { loadPositions = fn; },
     };
@@ -307,15 +309,123 @@ test('RH spread rows show normal basis, direction, both net figures and honest w
   const line = {
     base: 'SPY', category: 'INDICES', session: 'off', basis_pct: '-0.15254',
     normal: { median: -0.05, p10: -0.08, p90: -0.02, mad: 0.01, minutes: 900 }, normal_missing_minutes: 0, z: -10.3,
-    long_arcus: leg, long_lighter: null, best: { direction: 'long_arcus', signal: true, signal_sec: 12, net_usdt: '1.22' }, note: null,
+    pair: 'arcus:lighter-rh', a: 'arcus', b: 'lighter-rh', fee_round_trip_pct: '0.045',
+    long_a: leg, long_b: null, best: { direction: 'long_a', signal: true, signal_sec: 12, net_usdt: '1.22' }, note: null,
   };
   const row = app.rhRow(line, view);
-  for (const part of ['SPY', '盘后', '多 Arcus / 空 RH', '-0.050%', '+0.061%', '+0.102%', '+$1.22', '信号 12s', 'rh-signal']) {
+  for (const part of ['SPY', '盘后', '多 Arcus / 空 RH', 'Arcus ↔ RH', '往返费 0.045%', '-0.050%', '+0.061%', '+0.102%', '+$1.22', '信号 12s', 'rh-signal']) {
     assert.ok(row.includes(part), `${part} missing in ${row}`);
   }
   const warming = app.rhStatus({ ...line, normal: null, normal_missing_minutes: 37, best: { ...line.best, signal: false } }, view);
   assert.match(warming, /还差 37 分钟/);
   assert.match(app.rhStatus({ ...line, note: 'Arcus 盘口 20 秒没更新，不计算' }, view), /没更新/);
-  const noNormal = app.rhRow({ ...line, normal: null, z: null, long_arcus: { ...leg, net_to_normal_pct: null }, best: { ...line.best, signal: false, net_usdt: null } }, view);
+  const noNormal = app.rhRow({ ...line, normal: null, z: null, long_a: { ...leg, net_to_normal_pct: null }, best: { ...line.best, signal: false, net_usdt: null } }, view);
   assert.doesNotMatch(noNormal, /rh-signal/);
+});
+
+test('clicking an RH spread row opens the spread order form with the depth-chosen direction and a back-to-normal target', () => {
+  const { app } = harness();
+  const leg = { entry_pct: '0.17324', exit_cross_pct: '0.018', net_to_zero_pct: '0.11', net_to_normal_pct: '0.04' };
+  const line = {
+    base: 'NVDA', session: 'rth', basis_pct: '-0.196',
+    pair: 'arcus:lighter-rh', a: 'arcus', b: 'lighter-rh',
+    normal: { median: -0.111645, minutes: 1297 }, long_a: leg, long_b: null,
+    best: { direction: 'long_a', signal: false },
+  };
+  // 多 Arcus / 空 RH：持仓基差 = 空 − 多 = RH − Arcus = −(RH 页基差)，所以目标是 −中位数。
+  const order = plain(app.rhOrderTarget(line));
+  assert.deepEqual(
+    [order.symbol, order.long, order.short, order.target, order.negativeEntry],
+    ['NVDA/USDT', 'arcus', 'lighter-rh', '0.112', false],
+  );
+  const reverse = app.rhOrderTarget({ ...line, long_a: null, long_b: leg, best: { direction: 'long_b' } });
+  assert.deepEqual([reverse.long, reverse.short, reverse.target], ['lighter-rh', 'arcus', '-0.112']);
+  // 没有正常样本：不带目标；目标超出规则允许的 ±5% 也不带（不截断）。
+  assert.equal(app.rhOrderTarget({ ...line, normal: null }).target, null);
+  assert.equal(app.rhOrderTarget({ ...line, normal: { median: 7 } }).target, null);
+  // 可成交价差不为正：提前说明预览会被拒绝。
+  const negative = app.rhOrderTarget({ ...line, long_a: { ...leg, entry_pct: '-0.05' } });
+  assert.ok(negative.negativeEntry);
+  assert.match(app.rhOriginNote(negative), /预览会被拒绝/);
+
+  let shown = null;
+  app.mockShowPage((page) => { shown = page; });
+  app.state.strategy.view = 'funding';
+  app.state.strategy.form.basisExit = { on: false, value: '0.1' };
+  app.openRhInStrategy(line);
+  const s = app.state.strategy;
+  assert.equal(shown, 'strategy');
+  assert.deepEqual([s.view, s.a, s.b, s.userPicked], ['spread', 'arcus', 'lighter-rh', true]);
+  assert.deepEqual([s.selected.symbol, s.selected.long, s.selected.short], ['NVDA/USDT', 'arcus', 'lighter-rh']);
+  assert.deepEqual(plain(s.form.basisExit), { on: true, value: '0.112' });
+  assert.equal(app.ruleFields(s.form, 'spread').basis_exit, '0.112');
+  assert.match(app.rhOriginNote(s.selected.fromRh), /0\.112%/);
+  // 打开下单界面不会发任何请求、不会下单：只切页面和表单。
+  assert.equal(app.state.trade.preview, null);
+});
+
+test('RH auto-trading panel round-trips settings, needs a token, and makes live opt-in explicit', async () => {
+  const { app, context } = harness();
+  const settings = {
+    enabled: false, mode: 'paper', size_usdt: '500', leverage: '3', min_net_pct: '0.05', hold_sec: 10,
+    back_to_normal: true, take_profit_usdt: null, liq_protection_pct: null, max_positions: 1, daily_max_opens: 3, symbols: [],
+  };
+  const form = app.rhAutoForm(settings);
+  assert.equal(form.take_profit_usdt, '');
+  const body = plain(app.rhAutoBody({ ...form, take_profit_usdt: ' 1.5 ', symbols: 'nvda， spy' }, true));
+  assert.deepEqual(
+    [body.enabled, body.take_profit_usdt, body.liq_protection_pct, body.symbols, body.hold_sec],
+    [true, '1.5', null, ['NVDA', 'SPY'], 10],
+  );
+
+  const cfg = { auth_configured: true };
+  const a = { data: { settings, status: '监控中', max_failures: 2, events: [], open_positions: [], cooldown: [], paper_watch_sec: 0, live_can_trade: true, monitor_size_usdt: '2000' }, form, dirty: false };
+  const html = app.rhAutoHtml(a, cfg);
+  for (const part of ['已关闭', '开启纸面自动交易', '纸面规则没有在看板后台运行', '监控中']) assert.ok(html.includes(part), part);
+  const noExit = app.rhAutoHtml({ ...a, form: { ...form, back_to_normal: false } }, cfg);
+  assert.match(noExit, /至少开启一条退出规则/);
+  const bigger = app.rhAutoHtml({ ...a, form: { ...form, size_usdt: '5000' } }, cfg);
+  assert.match(bigger, /实际价差会更差/);
+  assert.match(app.rhAutoHtml(a, { auth_configured: false }), /ARB_WEB_TOKEN/);
+
+  // 开启实盘：不输入 LIVE 就不发请求；输入了才带上 confirm。
+  const sent = [];
+  app.mockApi(async (url, opts = {}) => {
+    if (opts.method === 'POST') sent.push(plain(opts.body));
+    return { ok: true, status: 200, body: { settings } };
+  });
+  context.document.getElementById = () => null;
+  app.state.rhAuto = { data: a.data, form: { ...form, mode: 'live' }, dirty: true, busy: false, message: null };
+  app.mockPrompt(() => 'live');
+  await app.saveRhAuto(true);
+  assert.equal(sent.length, 0, '没输入 LIVE 不发请求');
+  app.mockPrompt(() => 'LIVE');
+  await app.saveRhAuto(true);
+  assert.equal(sent.length, 1);
+  assert.deepEqual([sent[0].enabled, sent[0].mode, sent[0].confirm], [true, 'live', 'LIVE']);
+  // 纸面开启不需要确认。
+  app.state.rhAuto.form = { ...form, mode: 'paper' };
+  app.mockPrompt(() => { throw new Error('纸面不该弹确认'); });
+  await app.saveRhAuto(true);
+  assert.equal(sent[1].confirm, undefined);
+});
+
+test('other venue pairs open the order form with their own venues and sign-correct targets', () => {
+  const { app } = harness();
+  let shown = null;
+  app.mockShowPage((page) => { shown = page; });
+  const leg = { entry_pct: '0.12', exit_cross_pct: '0.01', net_to_zero_pct: '0.09', net_to_normal_pct: '0.07' };
+  // HL-xyz ↔ RH，多 RH / 空 HL-xyz（long_b）：持仓基差 = 空 − 多 = a − b = 页面基差 → 目标 = 中位数本身。
+  const line = {
+    pair: 'hyperliquid-xyz:lighter-rh', a: 'hyperliquid-xyz', b: 'lighter-rh', base: 'TSLA', session: 'rth',
+    normal: { median: 0.031 }, long_a: null, long_b: leg, best: { direction: 'long_b', signal: true },
+  };
+  const order = plain(app.rhOrderTarget(line));
+  assert.deepEqual([order.long, order.short, order.target], ['lighter-rh', 'hyperliquid-xyz', '0.031']);
+  assert.match(app.rhOriginNote(order), /HL-xyz ↔ RH/);
+  app.openRhInStrategy(line);
+  const s = app.state.strategy;
+  assert.equal(shown, 'strategy');
+  assert.deepEqual([s.a, s.b, s.selected.long, s.selected.short, s.selected.symbol], ['hyperliquid-xyz', 'lighter-rh', 'lighter-rh', 'hyperliquid-xyz', 'TSLA/USDT']);
+  assert.match(app.rhRow(line, { min_minutes: 120 }), /多 RH \/ 空 HL-xyz/);
 });

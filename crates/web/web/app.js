@@ -31,6 +31,7 @@ let state = {
   page: 'opps',
   rh: null,
   rhTimer: null,
+  rhAuto: { data: null, form: rhAutoForm({}), dirty: false, busy: false, message: null },
   livePendingTimer: null,
   config: null,
   data: null,
@@ -1010,7 +1011,10 @@ async function loadPairs({ quiet = false } = {}) {
   // 也保留 —— 开仓计划按合约现算，不依赖它在不在表里；场所换了才清掉。
   if (s.selected) {
     const row = s.board.rows.find((r) => String(r.symbol) === s.selected.symbol);
-    if (row && row.long && row.short) {
+    if (s.selected.fromRh) {
+      // 从 RH 价差页带来的方向是按两边深度、对照正常基差选的，不被标记价方向覆盖；场所换了才清掉。
+      if (![s.a, s.b].includes(s.selected.long) || ![s.a, s.b].includes(s.selected.short)) s.selected = null;
+    } else if (row && row.long && row.short) {
       s.selected = { symbol: String(row.symbol), long: row.long, short: row.short };
     } else if (![s.a, s.b].includes(s.selected.long) || ![s.a, s.b].includes(s.selected.short)) {
       s.selected = null;
@@ -1331,7 +1335,7 @@ function renderPlanShell() {
     card.innerHTML = `<div class="plan-empty"><b>开仓计划</b>在左边选一个合约，这里会给出两腿的保证金、强平价、每日资金费、成本和规则校验。</div>`;
     return;
   }
-  const key = `${s.view}|${s.selected.symbol}|${s.selected.long}|${s.selected.short}`;
+  const key = `${s.view}|${s.selected.symbol}|${s.selected.long}|${s.selected.short}|${s.selected.fromRh ? `rh:${s.selected.fromRh.target}` : ''}`;
   if (card.dataset.key === key) return;
   card.dataset.key = key;
   const f = s.form;
@@ -1343,6 +1347,7 @@ function renderPlanShell() {
       <span class="sym">${esc(s.selected.symbol)}</span>
       <span class="small">${legsText(s.selected.long, s.selected.short)}</span>
     </div>
+    ${rhOriginNote(s.selected.fromRh)}
     <div class="form-grid">
       <label class="field"><span>单腿名义 (USDT)</span><input type="number" id="plan-size" value="${esc(f.size)}" min="1" step="100" /></label>
       <label class="field"><span>杠杆（两腿相同）</span><select id="plan-leverage">
@@ -2727,9 +2732,34 @@ function renderPositions() {
   $('pos-closed-empty').textContent = closed.length ? '' : '还没有结束的仓位。';
 }
 
-// ───────────────────────────── RH 价差（只读） ─────────────────────────────
+// ───────────────────────────── 价差监控（RH 价差页） ─────────────────────────────
+//
+// 按「组」监控：每组两家 a / b，基差 = (a − b) / 均值，方向 long_a = 多 a 空 b、long_b = 多 b 空 a。
 
-const RH_DIRECTION = { long_arcus: '多 Arcus / 空 RH', long_lighter: '多 RH / 空 Arcus' };
+const VENUE_LABEL = {
+  arcus: 'Arcus', 'lighter-rh': 'RH', hyperliquid: 'HL', 'hyperliquid-xyz': 'HL-xyz', 'hyperliquid-io': 'HL-io',
+};
+const venueLabel = (venue) => VENUE_LABEL[venue] || venue;
+const pairLabel = (line) => `${venueLabel(line.a)} ↔ ${venueLabel(line.b)}`;
+// 自动交易做哪些组：两家都是实盘已连接的场所（纸面模式下全部组）。与服务端同一口径。
+function rhAutoTradable(pair) {
+  const mode = state.rhAuto?.data?.settings?.mode;
+  if (mode === 'paper') return true;
+  const venues = state.tradeConfig?.live?.venues || [];
+  return venues.includes(pair.a) && venues.includes(pair.b);
+}
+
+// 一个方向的两条腿：{ long, short }。
+function rhLegs(line, direction = line.best?.direction) {
+  if (direction === 'long_a') return { long: line.a, short: line.b };
+  if (direction === 'long_b') return { long: line.b, short: line.a };
+  return null;
+}
+
+function rhDirectionText(line) {
+  const legs = rhLegs(line);
+  return legs ? `多 ${venueLabel(legs.long)} / 空 ${venueLabel(legs.short)}` : null;
+}
 
 // 一个方向的数字：可成交价差、收敛到 0、回到正常。
 function rhBestLeg(line) {
@@ -2759,13 +2789,14 @@ function rhRow(line, view) {
   const zText = z === null ? '<span class="muted">—</span>' : `<span class="${Math.abs(z) >= 3 ? 'neg' : 'muted'}">${z > 0 ? '+' : ''}${z.toFixed(1)}</span>`;
   const net = leg?.net_to_normal_pct;
   const usdText = line.best?.net_usdt == null ? '' : ` <span class="muted small">≈ ${pnlUsd(line.best.net_usdt)}</span>`;
-  return `<tr class="${line.best?.signal ? 'rh-signal' : ''}">
-    <td><b>${esc(line.base)}</b> <span class="muted small">${esc((line.category || '').toLowerCase())}</span></td>
+  const fee = line.fee_round_trip_pct == null ? '' : ` · 往返费 ${num(line.fee_round_trip_pct)}%`;
+  return `<tr class="${line.best?.signal ? 'rh-signal' : ''}" data-rh-pair="${esc(line.pair)}" data-rh-base="${esc(line.base)}" title="点击打开下单界面：带上方向和回到正常基差的收敛目标（仍需预览确认）">
+    <td><b>${esc(line.base)}</b> <span class="muted small">${esc((line.category || '').toLowerCase())}</span><br><span class="muted small">${esc(pairLabel(line))}${esc(fee)}</span></td>
     <td>${esc(RH_SESSION[line.session] || line.session)}</td>
     <td class="num ${cls(line.basis_pct)}">${pctRaw(line.basis_pct, 3)}</td>
     <td class="num">${normalText}</td>
     <td class="num">${zText}</td>
-    <td>${line.best ? esc(RH_DIRECTION[line.best.direction] || line.best.direction) : '<span class="muted">—</span>'}</td>
+    <td>${line.best ? esc(rhDirectionText(line) || line.best.direction) : '<span class="muted">—</span>'}</td>
     <td class="num">${leg ? `${pctRaw(leg.entry_pct, 3)} <span class="muted small" title="平仓穿价">−${pctRaw(leg.exit_cross_pct, 3).replace('+', '')}</span>` : '—'}</td>
     <td class="num ${cls(leg?.net_to_zero_pct)}">${leg ? pctRaw(leg.net_to_zero_pct, 3) : '—'}</td>
     <td class="num ${cls(net)}">${net == null ? '<span class="muted">—</span>' : pctRaw(net, 3)}${usdText}</td>
@@ -2775,31 +2806,136 @@ function rhRow(line, view) {
 
 const RH_SESSION = { rth: '盘中', off: '盘后', weekend: '周末', all: '全天' };
 
+// 价差页的一行 → 策略页（价差视角）的下单参数。
+// 基差口径不同：价差页是 (a − b) / 均值；持仓规则是 (空腿 − 多腿) / 均值。
+// 多 a / 空 b 时持仓基差 = −页面基差，所以「回到正常」的收敛目标 = −正常中位数；反方向就是中位数本身。
+function rhOrderTarget(line) {
+  const direction = line.best?.direction;
+  const legs = rhLegs(line, direction);
+  const long = legs?.long ?? null;
+  const short = legs?.short ?? null;
+  const leg = direction ? line[direction] : null;
+  const median = num(line.normal?.median);
+  let target = null;
+  if (long && median !== null) {
+    const raw = direction === 'long_a' ? -median : median;
+    // 规则只接受 ±5%；超出就不带目标（不截断成一个意思不同的数）。
+    if (Math.abs(raw) <= 5) target = (Math.round(raw * 1000) / 1000).toFixed(3);
+  }
+  return {
+    symbol: `${line.base}/USDT`,
+    long,
+    short,
+    target,
+    direction,
+    entryPct: leg?.entry_pct ?? null,
+    netToNormalPct: leg?.net_to_normal_pct ?? null,
+    session: line.session,
+    a: line.a,
+    b: line.b,
+    pairLabel: pairLabel(line),
+    // 价差单要求空腿卖得出的价高于多腿要买的价：可成交价差不为正时预览会被拒绝。
+    negativeEntry: leg ? num(leg.entry_pct) <= 0 : false,
+  };
+}
+
+function rhOriginNote(origin) {
+  if (!origin) return '';
+  const parts = [`来自价差监控页（${esc(origin.pairLabel || '')}，${esc(RH_SESSION[origin.session] || origin.session || '')}）：方向按两边深度、对照同时段正常基差选出`];
+  parts.push(origin.target != null
+    ? `基差收敛目标已设为 <b>${esc(origin.target)}%</b>（回到正常水平就平仓）`
+    : '还没有正常基差样本，收敛目标沿用你原来的设置');
+  if (origin.netToNormalPct != null) parts.push(`RH 页估算回到正常净收益 ${pctRaw(origin.netToNormalPct, 3)}`);
+  const warn = origin.negativeEntry
+    ? `<br><b>注意：</b>这个方向当前可成交价差为 ${pctRaw(origin.entryPct, 3)}（不为正），价差单要求空腿卖价高于多腿买价，预览会被拒绝。`
+    : '';
+  return `<div class="alert ${origin.negativeEntry ? 'warn' : 'info'} small">${parts.join('；')}。下单前仍需预览并确认。${warn}</div>`;
+}
+
+// 点价差页的一行：切到策略页价差视角，选好这一组的两家、合约、方向和收敛目标。不下单。
+function openRhInStrategy(line) {
+  const order = rhOrderTarget(line);
+  const s = state.strategy;
+  s.userPicked = true;
+  s.a = line.a;
+  s.b = line.b;
+  if (s.view !== 'spread') {
+    s.view = 'spread';
+    try {
+      localStorage.setItem('arb-web-strategy-view', 'spread');
+    } catch {
+      // 存不了就只在本次会话里生效。
+    }
+  }
+  if (order.target != null) s.form.basisExit = { ...s.form.basisExit, on: true, value: order.target };
+  s.selected = order.long
+    ? { symbol: order.symbol, long: order.long, short: order.short, fromRh: order }
+    : { symbol: order.symbol, long: null, short: null };
+  s.plan = null;
+  const card = $('plan-card');
+  if (card) card.dataset.key = '';
+  showPage('strategy');
+}
+
+// 组选择：全部 / 某一组。存在本机。
+function rhPairFilter() {
+  try {
+    return localStorage.getItem('arb-web-rh-pair') || 'all';
+  } catch {
+    return state.rhPair || 'all';
+  }
+}
+
+function setRhPairFilter(value) {
+  state.rhPair = value;
+  try {
+    localStorage.setItem('arb-web-rh-pair', value);
+  } catch {
+    // 存不了就只在本次会话里生效。
+  }
+  renderRhSpread();
+}
+
 function renderRhSpread() {
   const view = state.rh;
   if (!view) return;
   const conn = view.connected || {};
-  const dot = (ok, name) => `<span class="${ok ? 'pos' : 'neg'}">${ok ? '●' : '○'} ${name}</span>`;
-  $('rh-status').innerHTML = `${dot(conn.lighter, 'Lighter RH')} · ${dot(conn.arcus, 'Arcus')} · 更新于 ${when(view.updated_at)}${conn.reconnects ? ` · 重连 ${conn.reconnects} 次` : ''}`;
-  const lines = view.lines || [];
+  const dot = (ok, name) => `<span class="${ok ? 'pos' : 'neg'}">${ok ? '●' : '○'} ${esc(name)}</span>`;
+  const venues = Object.entries(conn.venues || {});
+  $('rh-status').innerHTML = `${venues.map(([venue, up]) => dot(up, venueLabel(venue))).join(' · ')} · 更新于 ${when(view.updated_at)}${conn.reconnects ? ` · 重连 ${conn.reconnects} 次` : ''}`;
+  const pairs = view.pairs || [];
+  const filter = pairs.some((p) => p.id === rhPairFilter()) ? rhPairFilter() : 'all';
+  const select = $('rh-pair');
+  if (select) {
+    select.innerHTML = [`<option value="all">全部组（${pairs.length}）</option>`]
+      .concat(pairs.map((p) => `<option value="${esc(p.id)}"${p.id === filter ? ' selected' : ''}>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}（${p.markets}）</option>`))
+      .join('');
+    select.value = filter;
+  }
+  const all = view.lines || [];
+  const lines = filter === 'all' ? all : all.filter((l) => l.pair === filter);
   const signals = lines.filter((l) => l.best?.signal);
-  const hours = (view.history_minutes / 60).toFixed(1);
   $('rh-stats').innerHTML = [
     ['合约', String(lines.length), ''],
     ['当前信号', String(signals.length), signals.length ? 'pos' : 'dim'],
     ['估算名义', `$${num(view.size_usdt).toLocaleString('en-US')}`, ''],
     ['提醒门槛', `≥ ${num(view.alert_net_pct)}%`, ''],
-    ['往返手续费', view.fee_round_trip_pct == null ? '—' : `${num(view.fee_round_trip_pct)}%`, ''],
-    ['已攒历史', `${hours} 小时`, ''],
   ].map(([label, value, tone]) => `<div class="stat"><span>${label}</span><b class="${tone}">${esc(value)}</b></div>`).join('');
+  const shownPairs = filter === 'all' ? pairs : pairs.filter((p) => p.id === filter);
+  const feeText = (p) => p.fee_min_pct == null ? '—' : num(p.fee_min_pct) === num(p.fee_max_pct) ? `${num(p.fee_min_pct)}%` : `${num(p.fee_min_pct)}% ~ ${num(p.fee_max_pct)}%`;
+  const pairRows = shownPairs.map((p) => `<li><b>${esc(`${venueLabel(p.a)} ↔ ${venueLabel(p.b)}`)}</b>：${p.markets} 个合约，往返手续费 ${esc(feeText(p))}，已攒历史 ${(p.history_minutes / 60).toFixed(1)} 小时${rhAutoTradable(p) ? '，<span class="pos">可自动交易</span>' : '，只监控（实盘没连这两家）'}${p.note ? ` <span class="muted">（${esc(p.note)}）</span>` : ''}</li>`).join('');
   const notices = [];
   if (view.error) notices.push(`<div class="notice error">${esc(view.error)}</div>`);
-  if (view.history_minutes < view.min_minutes) {
-    notices.push(`<div class="notice">正在积累历史：每个合约每个时段至少 ${view.min_minutes} 分钟样本才算出「正常基差」并开始提醒（窗口 ${view.window_days} 天）。在那之前只显示「收敛到 0」的估算 —— 对股票类合约这通常偏乐观。</div>`);
-  }
+  if (pairRows) notices.push(`<div class="notice"><ul>${pairRows}</ul><span class="small muted">基差 = (左 − 右) / 均值。每个合约每个时段至少 ${view.min_minutes} 分钟样本才算出「正常基差」并开始提醒（窗口 ${view.window_days} 天）；在那之前只显示「收敛到 0」的估算，对股票类合约通常偏乐观。往返费按基础档上限算（HL 子交易所含 growth mode 折扣与 Entropy 返佣设置）。</span></div>`);
   $('rh-notice').innerHTML = notices.join('');
   const shown = $('rh-signal-only').checked ? signals : lines;
   $('rh-rows').innerHTML = shown.map((line) => rhRow(line, view)).join('');
+  for (const tr of $('rh-rows').querySelectorAll('tr[data-rh-base]')) {
+    tr.addEventListener('click', () => {
+      const line = (state.rh?.lines || []).find((l) => l.base === tr.getAttribute('data-rh-base') && l.pair === tr.getAttribute('data-rh-pair'));
+      if (line) openRhInStrategy(line);
+    });
+  }
   $('rh-empty').textContent = shown.length ? '' : (lines.length ? '当前没有信号。' : '等待行情…');
 }
 
@@ -2808,6 +2944,171 @@ async function loadRhSpread() {
   if (!result.ok) throw new Error(result.body?.error || `HTTP ${result.status}`);
   state.rh = result.body;
   renderRhSpread();
+  loadRhAuto().catch(() => {});
+}
+
+// ───────────────────────────── RH 价差自动交易 ─────────────────────────────
+//
+// 设置存在服务端（auto.json）。表单只在没有未保存改动时跟着服务端刷新，免得打字时被冲掉。
+
+const RH_AUTO_FIELDS = [
+  ['size_usdt', '单腿名义 (USDT)', 'number', '10', '每笔两腿各这么多名义'],
+  ['leverage', '杠杆（整数）', 'number', '1', '两腿相同，逐仓'],
+  ['min_net_pct', '触发门槛 (%)', 'number', '0.01', '「回到正常净收益」≥ 它才下单（已扣手续费与平仓穿价）'],
+  ['hold_sec', '信号保持 (秒)', 'number', '1', '连续达标这么久才下单，过滤一闪而过的挂单'],
+  ['take_profit_usdt', '止盈 (USDT)', 'number', '0.01', '含资金费的净盈利达到它就平仓（按盘口核对）；留空不设'],
+  ['liq_protection_pct', '爆仓保护 (%)', 'number', '1', '强平距离低于它两腿等比例减仓；留空不设'],
+  ['max_positions', '同时最多 (笔)', 'number', '1', '自动开的仓位同时最多几笔'],
+  ['daily_max_opens', '每日最多 (笔)', 'number', '1', '每个 UTC 日最多自动开几笔'],
+];
+
+function rhAutoForm(settings) {
+  return {
+    enabled: Boolean(settings.enabled),
+    mode: settings.mode || 'paper',
+    size_usdt: String(settings.size_usdt ?? '500'),
+    leverage: String(settings.leverage ?? '3'),
+    min_net_pct: String(settings.min_net_pct ?? '0.05'),
+    hold_sec: String(settings.hold_sec ?? '10'),
+    back_to_normal: settings.back_to_normal !== false,
+    take_profit_usdt: settings.take_profit_usdt == null ? '' : String(settings.take_profit_usdt),
+    liq_protection_pct: settings.liq_protection_pct == null ? '' : String(settings.liq_protection_pct),
+    max_positions: String(settings.max_positions ?? '1'),
+    daily_max_opens: String(settings.daily_max_opens ?? '3'),
+    symbols: (settings.symbols || []).join(','),
+  };
+}
+
+// 表单 → 请求体。空的可选项发 null（关闭），数字按字符串发（服务端按十进制解析）。
+function rhAutoBody(form, enabled) {
+  const optional = (value) => (String(value).trim() === '' ? null : String(value).trim());
+  return {
+    enabled,
+    mode: form.mode,
+    size_usdt: String(form.size_usdt).trim(),
+    leverage: String(form.leverage).trim(),
+    min_net_pct: String(form.min_net_pct).trim(),
+    hold_sec: Number(form.hold_sec),
+    back_to_normal: Boolean(form.back_to_normal),
+    take_profit_usdt: optional(form.take_profit_usdt),
+    liq_protection_pct: optional(form.liq_protection_pct),
+    max_positions: Number(form.max_positions),
+    daily_max_opens: Number(form.daily_max_opens),
+    symbols: String(form.symbols).split(/[,，\s]+/).map((s) => s.trim().toUpperCase()).filter(Boolean),
+  };
+}
+
+async function loadRhAuto() {
+  const a = state.rhAuto;
+  if (!state.tradeConfig?.auth_configured || !token()) {
+    a.data = null;
+    renderRhAuto();
+    return;
+  }
+  const { ok, body } = await api('/api/rh-spread/auto', { auth: true });
+  a.data = ok ? body : { error: body.error };
+  if (ok && !a.dirty) a.form = rhAutoForm(body.settings);
+  renderRhAuto();
+}
+
+async function saveRhAuto(enabled) {
+  const a = state.rhAuto;
+  const body = rhAutoBody(a.form, enabled);
+  if (enabled && body.mode === 'live' && !(a.data?.settings?.enabled && a.data?.settings?.mode === 'live')) {
+    const typed = window.prompt(`开启【实盘】自动交易：信号出现时机器人会用真实资金自动下单（每笔两腿各 ${body.size_usdt} USDT）。\n确认请输入 LIVE`);
+    if ((typed || '').trim() !== 'LIVE') return;
+    body.confirm = 'LIVE';
+  }
+  a.busy = true;
+  a.message = null;
+  renderRhAuto();
+  const { ok, body: result } = await api('/api/rh-spread/auto', { method: 'POST', body, auth: true });
+  a.busy = false;
+  if (ok) {
+    a.dirty = false;
+    a.message = { tone: 'info', text: enabled ? '已保存并开启。' : '已保存（自动交易关闭）。' };
+  } else {
+    a.message = { tone: 'error', text: result.error || '保存失败' };
+  }
+  await loadRhAuto().catch(() => {});
+  renderRhAuto();
+}
+
+const RH_AUTO_EVENT = { opened: '开仓', unwound: '回滚', rejected: '被拒', paused: '暂停', disabled: '关闭', settings: '设置' };
+
+function rhAutoHtml(a, cfg) {
+  if (!cfg?.auth_configured) return '<h3>自动交易</h3><p class="muted small">看板没有配置 ARB_WEB_TOKEN，自动交易不可用。</p>';
+  if (!token()) return '<h3>自动交易</h3><p class="muted small">点右上角「令牌」填写后才能查看和设置自动交易。</p>';
+  const data = a.data;
+  if (!data) return '<h3>自动交易</h3><p class="muted small">读取中…</p>';
+  if (data.error) return `<h3>自动交易</h3><div class="notice error">${esc(data.error)}</div>`;
+  const f = a.form;
+  const on = Boolean(data.settings.enabled);
+  const liveMode = data.settings.mode === 'live';
+  const badge = on
+    ? `<span class="tag ${liveMode ? 'coral' : 'pc-pass'}">${liveMode ? '实盘自动交易中' : '纸面自动交易中'}</span>`
+    : '<span class="tag">已关闭</span>';
+  const field = ([key, label, type, step, hint]) => `<label class="field" title="${esc(hint)}"><span>${esc(label)}</span><input type="${type}" step="${step}" data-rh-auto="${key}" value="${esc(f[key])}"${key === 'take_profit_usdt' || key === 'liq_protection_pct' ? ' placeholder="不设"' : ''} /></label>`;
+  const maxSize = data.max_position_usdt;
+  const warnings = [];
+  if (f.mode === 'live' && !data.live_can_trade) warnings.push('实盘没连上或是只读模式：不能开启实盘自动交易。');
+  if (f.mode === 'paper' && !data.paper_watch_sec) warnings.push('纸面规则没有在看板后台运行（ARB_WEB_PAPER_WATCH_SEC=0）：纸面自动仓位不会被自动平仓，只能在持仓页手动「执行一轮规则」。');
+  if (!f.back_to_normal && String(f.take_profit_usdt).trim() === '') warnings.push('至少开启一条退出规则（回到正常基差平仓 / 止盈），否则不能保存。');
+  if (num(f.size_usdt) !== null && num(data.monitor_size_usdt) !== null && num(f.size_usdt) > num(data.monitor_size_usdt)) {
+    warnings.push(`表格里的净收益按 ${num(data.monitor_size_usdt)} USDT 估算；你的单笔更大，吃得更深，实际价差会更差（下单前按你的金额重算，不够会被拒）。`);
+  }
+  const opened = data.open_positions || [];
+  const events = (data.events || []).slice(0, 12);
+  return `
+    <div class="row-head">
+      <h3>自动交易（全部组）</h3> ${badge}
+      <span class="grow"></span>
+      <span class="small muted">${esc(data.status || '')}</span>
+    </div>
+    ${data.disabled_reason && !on ? `<div class="notice error">上次自动关闭的原因：${esc(data.disabled_reason)}</div>` : ''}
+    <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净收益」达到门槛、且开仓可成交价差与收敛到 0 净收益都为正、连续保持够久后，按下面的参数自动下一笔价差单。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
+    <div class="rh-auto-grid">
+      <label class="field"><span>账户</span><select data-rh-auto="mode">
+        <option value="paper"${f.mode === 'paper' ? ' selected' : ''}>纸面（不碰真实资金）</option>
+        <option value="live"${f.mode === 'live' ? ' selected' : ''}>实盘（真实资金）</option>
+      </select></label>
+      ${RH_AUTO_FIELDS.map(field).join('')}
+      <label class="field" title="逗号分隔，如 NVDA,SPY；留空 = 全部合约"><span>只做这些合约</span><input type="text" data-rh-auto="symbols" value="${esc(f.symbols)}" placeholder="全部" /></label>
+    </div>
+    <label class="small rh-auto-check"><input type="checkbox" data-rh-auto="back_to_normal"${f.back_to_normal ? ' checked' : ''} /> 回到同时段正常基差就平仓（按方向换算成「基差收敛平仓」目标，按盘口核对净收益为正才平）</label>
+    ${warnings.map((w) => `<div class="alert warn small">${esc(w)}</div>`).join('')}
+    ${a.message ? `<div class="alert ${a.message.tone === 'error' ? 'error' : 'info'} small">${esc(a.message.text)}</div>` : ''}
+    <div class="plan-actions">
+      ${on
+        ? `<button type="button" class="btn ghost" data-rh-auto-save${a.busy ? ' disabled' : ''}>保存参数（保持开启）</button><button type="button" class="btn primary" data-rh-auto-off${a.busy ? ' disabled' : ''}>关闭自动交易</button>`
+        : `<button type="button" class="btn ghost" data-rh-auto-save${a.busy ? ' disabled' : ''}>只保存参数</button><button type="button" class="btn primary" data-rh-auto-on${a.busy ? ' disabled' : ''}>${f.mode === 'live' ? '开启实盘自动交易' : '开启纸面自动交易'}</button>`}
+      ${a.dirty ? '<span class="small muted">有未保存的改动</span>' : ''}
+    </div>
+    <div class="small muted">今天（UTC）已自动开 ${Number(data.opened_today) || 0} 笔；自动仓位持有中 ${opened.length} 笔${opened.length ? `：${opened.map((o) => esc(`${o.id} ${o.symbol}`)).join('、')}` : ''}${(data.cooldown || []).length ? `；冷却中：${data.cooldown.map((c) => esc(`${c.symbol} ${c.sec}s`)).join('、')}` : ''}</div>
+    ${events.length ? `<details class="rh-auto-events"><summary>最近动作（${events.length}）</summary><ul>${events.map((e) => `<li><span class="muted">${when(e.at)}</span> <b>${esc(RH_AUTO_EVENT[e.kind] || e.kind)}</b> ${esc(e.text)}</li>`).join('')}</ul></details>` : ''}`;
+}
+
+function renderRhAuto() {
+  const box = $('rh-auto');
+  if (!box) return;
+  // 正在输入时不重画：只更新状态文字。
+  if (box.contains(document.activeElement) && document.activeElement.matches('input, select')) return;
+  box.innerHTML = rhAutoHtml(state.rhAuto, state.tradeConfig);
+  for (const input of box.querySelectorAll('[data-rh-auto]')) {
+    const key = input.getAttribute('data-rh-auto');
+    const update = () => {
+      state.rhAuto.form[key] = input.type === 'checkbox' ? input.checked : input.value;
+      state.rhAuto.dirty = true;
+    };
+    input.addEventListener('input', update);
+    input.addEventListener('change', () => {
+      update();
+      renderRhAuto();
+    });
+  }
+  box.querySelector('[data-rh-auto-on]')?.addEventListener('click', () => saveRhAuto(true));
+  box.querySelector('[data-rh-auto-off]')?.addEventListener('click', () => saveRhAuto(false));
+  box.querySelector('[data-rh-auto-save]')?.addEventListener('click', () => saveRhAuto(Boolean(state.rhAuto.data?.settings?.enabled)));
 }
 
 function scheduleRh() {
@@ -3021,6 +3322,7 @@ function wire() {
 
   // RH 价差页
   $('rh-signal-only').addEventListener('change', renderRhSpread);
+  $('rh-pair').addEventListener('change', (event) => setRhPairFilter(event.target.value));
 }
 
 (async function main() {
